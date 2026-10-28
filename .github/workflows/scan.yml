@@ -2,15 +2,10 @@ name: scan
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'
-
+    - cron: '*/10 * * * *'
 jobs:
   scan:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        index: [0, 1, 2, 3]
-      fail-fast: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,5 +18,4 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           GH_PAT: ${{ secrets.GH_PAT }}
           REPO_INDEX: '0'
-          MATRIX_INDEX: ${{ matrix.index }}
         run: node worker.js

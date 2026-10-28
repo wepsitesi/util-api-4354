@@ -21,6 +21,7 @@ jobs:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DISCORD_PASSWORD: ${{ secrets.DISCORD_PASSWORD }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           REPO_INDEX: '0'
           MATRIX_INDEX: ${{ matrix.index }}
         run: node worker.js

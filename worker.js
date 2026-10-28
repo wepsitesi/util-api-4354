@@ -1,20 +1,23 @@
-// GitHub Actions Worker — Discord Username Sniper
-// Static partitioning: no DB needed, each worker gets a unique slice
-// Env: DISCORD_TOKEN, DISCORD_PASSWORD, WEBHOOK_URL, REPO_INDEX (0-4), MATRIX_INDEX (0-3)
+// GitHub Actions Worker — Discord Username Sniper v3
+// Static partitioning + progress persistence via GitHub API
+// On 429: save progress to repo, exit immediately for fresh IP
+// On restart: resume from saved progress
 
 const https = require('https');
+const { execSync } = require('child_process');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_PASSWORD = process.env.DISCORD_PASSWORD;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const GH_TOKEN = process.env.GH_PAT;
 const REPO_INDEX = parseInt(process.env.REPO_INDEX || '0');
 const MATRIX_INDEX = parseInt(process.env.MATRIX_INDEX || '0');
 const WORKER_ID = `w${REPO_INDEX}-${MATRIX_INDEX}`;
-const TOTAL_WORKERS = 20; // 5 repos x 4 matrix
+const TOTAL_WORKERS = 20;
 const GLOBAL_INDEX = REPO_INDEX * 4 + MATRIX_INDEX;
 const CHECK_DELAY_MS = 800;
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || '';
 
-// Generate all 3L candidates: a-z first char, a-z0-9_. rest
 function generateAllCandidates() {
     const alpha = 'abcdefghijklmnopqrstuvwxyz';
     const charset = 'abcdefghijklmnopqrstuvwxyz0123456789_.';
@@ -81,38 +84,79 @@ async function sendWebhook(content, embeds) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function formatDuration(ms) {
-    const s = Math.floor(ms / 1000);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    return `${h}h${m}m`;
+// Progress persistence via GitHub API
+async function loadProgress() {
+    if (!GH_TOKEN || !GITHUB_REPOSITORY) return 0;
+    try {
+        const res = await httpRequest(
+            `https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/progress/${WORKER_ID}.txt`,
+            { method: 'GET', headers: { 'Authorization': `token ${GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'sniper' } }
+        );
+        if (res.status === 200) {
+            const data = JSON.parse(res.body);
+            const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
+            return parseInt(content) || 0;
+        }
+    } catch(e) {}
+    return 0;
+}
+
+async function saveProgress(index) {
+    if (!GH_TOKEN || !GITHUB_REPOSITORY) return;
+    try {
+        // Get current SHA if exists
+        let sha = null;
+        const getRes = await httpRequest(
+            `https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/progress/${WORKER_ID}.txt`,
+            { method: 'GET', headers: { 'Authorization': `token ${GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'sniper' } }
+        );
+        if (getRes.status === 200) {
+            sha = JSON.parse(getRes.body).sha;
+        }
+
+        const payload = {
+            message: `progress ${WORKER_ID}: ${index}`,
+            content: Buffer.from(String(index)).toString('base64')
+        };
+        if (sha) payload.sha = sha;
+
+        await httpRequest(
+            `https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/progress/${WORKER_ID}.txt`,
+            { method: 'PUT', headers: { 'Authorization': `token ${GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json', 'User-Agent': 'sniper' } },
+            JSON.stringify(payload)
+        );
+    } catch(e) {
+        console.log(`[${WORKER_ID}] Progress save error: ${e.message}`);
+    }
 }
 
 async function main() {
     const allCandidates = generateAllCandidates();
     const total = allCandidates.length;
     const chunkSize = Math.ceil(total / TOTAL_WORKERS);
-    const start = GLOBAL_INDEX * chunkSize;
-    const end = Math.min(start + chunkSize, total);
-    const myCandidates = allCandidates.slice(start, end);
+    const sliceStart = GLOBAL_INDEX * chunkSize;
+    const sliceEnd = Math.min(sliceStart + chunkSize, total);
+    const myCandidates = allCandidates.slice(sliceStart, sliceEnd);
 
-    console.log(`[${WORKER_ID}] Slice: ${start}-${end} (${myCandidates.length} usernames out of ${total})`);
+    // Load progress
+    const savedIndex = await loadProgress();
+    const resumeFrom = Math.min(savedIndex, myCandidates.length);
+
+    console.log(`[${WORKER_ID}] Slice: ${sliceStart}-${sliceEnd} (${myCandidates.length} total, resuming from ${resumeFrom})`);
 
     const startTime = Date.now();
     let checked = 0;
     let found = [];
-    let rateLimits = 0;
     let lastReportTime = Date.now();
 
-    // Startup webhook
     await sendWebhook(null, [{
         title: `\u{1F680} ${WORKER_ID} Started`,
         color: 0x3498db,
-        description: `Slice: \`${start}\`-\`${end}\` (${myCandidates.length} usernames)\nGlobal worker #${GLOBAL_INDEX}`,
+        description: `Slice: ${myCandidates.length} usernames\nResuming from: #${resumeFrom}\nRemaining: ${myCandidates.length - resumeFrom}`,
         timestamp: new Date().toISOString()
     }]);
 
-    for (let i = 0; i < myCandidates.length; i++) {
+    for (let i = resumeFrom; i < myCandidates.length; i++) {
         const username = myCandidates[i];
 
         try {
@@ -144,6 +188,7 @@ async function main() {
                                 description: `Successfully claimed **\`${username}\`**!`,
                                 timestamp: new Date().toISOString()
                             }]);
+                            await saveProgress(i + 1);
                             return;
                         } else {
                             await sendWebhook(null, [{
@@ -156,48 +201,55 @@ async function main() {
                     }
                 }
             } else if (res.status === 429) {
-                rateLimits++;
-                let retryAfter = 5;
-                try { const p = JSON.parse(res.body); if (p.retry_after) retryAfter = p.retry_after; } catch(e) {}
-                console.log(`[${WORKER_ID}] 429 — wait ${retryAfter}s (RL #${rateLimits})`);
-                await sleep(retryAfter * 1000 + 500);
-                i--; // retry same
-                continue;
+                console.log(`[${WORKER_ID}] 429 at index ${i}. Saving progress and exiting.`);
+
+                await saveProgress(i);
+
+                await sendWebhook(null, [{
+                    title: `\u{1F6D1} ${WORKER_ID} Rate-Limited`,
+                    color: 0xf0b232,
+                    fields: [
+                        { name: 'Checked', value: `${checked} this run`, inline: true },
+                        { name: 'Progress', value: `${i}/${myCandidates.length}`, inline: true },
+                        { name: 'Found', value: `${found.length}`, inline: true }
+                    ],
+                    timestamp: new Date().toISOString()
+                }]);
+
+                process.exit(0);
             }
         } catch(e) {
             console.log(`[${WORKER_ID}] Error: ${e.message}`);
             await sleep(3000);
-            i--;
             continue;
         }
 
-        // Status report every 60s
+        // Status every 60s
         if (Date.now() - lastReportTime > 60000) {
-            const elapsed = Date.now() - startTime;
-            const pct = ((checked / myCandidates.length) * 100).toFixed(1);
+            const pct = (((resumeFrom + checked) / myCandidates.length) * 100).toFixed(1);
             await sendWebhook(null, [{
                 title: `\u{1F50D} ${WORKER_ID} Status`,
                 color: 0x3498db,
                 fields: [
-                    { name: 'Checked', value: `${checked}/${myCandidates.length} (${pct}%)`, inline: true },
-                    { name: 'Rate-Limits', value: `${rateLimits}`, inline: true },
+                    { name: 'Progress', value: `${resumeFrom + checked}/${myCandidates.length} (${pct}%)`, inline: true },
+                    { name: 'This Run', value: `${checked} checked`, inline: true },
                     { name: 'Found', value: `${found.length}`, inline: true },
-                    { name: 'Uptime', value: formatDuration(elapsed), inline: true },
                     { name: 'Last', value: `\`${username}\``, inline: true }
                 ],
                 timestamp: new Date().toISOString()
             }]);
             lastReportTime = Date.now();
+            await saveProgress(i);
         }
 
         await sleep(CHECK_DELAY_MS);
     }
 
-    // Done
+    await saveProgress(myCandidates.length);
     await sendWebhook(null, [{
         title: `\u{1F3C1} ${WORKER_ID} Complete`,
         color: 0x2ecc71,
-        description: `Checked all ${myCandidates.length} usernames.\nFound: ${found.length}\nRate-Limits: ${rateLimits}\nUptime: ${formatDuration(Date.now() - startTime)}`,
+        description: `All ${myCandidates.length} checked.\nFound: ${found.length}`,
         timestamp: new Date().toISOString()
     }]);
 }
